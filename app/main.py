@@ -36,7 +36,7 @@ def _persist_jobs_locked():
     temporary = JOBS_FILE.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(JOBS), encoding="utf-8")
     temporary.replace(JOBS_FILE)
-app = FastAPI(title="KangoDL Engine", description="Independent media extraction and processing engine.", version="0.6.0")
+app = FastAPI(title="KangoDL Engine", description="Independent media extraction and processing engine.", version="0.7.0")
 API_KEY = os.getenv("KANGODL_API_KEY", "").strip()
 REQUIRE_API_KEY = os.getenv("KANGODL_REQUIRE_API_KEY", "0").lower() in {"1", "true", "yes"}
 
@@ -57,13 +57,13 @@ async def api_key_guard(request: Request, call_next):
             return JSONResponse(status_code=401, content={"detail": "A valid API key is required."})
     return await call_next(request)
 
-OUTPUT_FORMATS = {"mp3": ".mp3", "mp4": ".mp4"}
+OUTPUT_FORMATS = {"mp3": ".mp3", "mp4": ".mp4", "webm": ".webm"}
 
 class DownloadRequest(BaseModel):
     url: str
     format_id: str | None = None
     mode: str = Field(default="video", pattern="^(video|audio)$")
-    output: str = Field(default="mp4", pattern="^(mp4|mp3)$")
+    output: str = Field(default="mp4", pattern="^(mp4|mp3|webm)$")
 
 def resolve_media(file_id: str) -> Path:
     if not re.fullmatch(r"[a-f0-9]{32}", file_id):
@@ -126,7 +126,9 @@ def _run_download_job(job_id: str, request_data: dict):
                 audio_candidates = [f for f in formats if f.get("has_audio") and f.get("_direct_url")]
             if not audio_candidates:
                 raise RuntimeError("No directly downloadable audio stream was returned.")
-            selected = max(audio_candidates, key=lambda f: f.get("bitrate") or 0)
+            selected = next((f for f in audio_candidates if f["format_id"] == str(request_data.get("format_id"))), None) if request_data.get("format_id") else None
+            if selected is None:
+                selected = max(audio_candidates, key=lambda f: f.get("bitrate") or 0)
         elif selected is None:
             video_candidates = [f for f in formats if f.get("has_video") and f.get("height") and f.get("_direct_url")]
             if not video_candidates:
@@ -160,12 +162,26 @@ def _run_download_job(job_id: str, request_data: dict):
         else:
             _download_url(selected["_direct_url"], video_path, job_id, "Downloading video")
         if request_data["mode"] == "audio":
-            _job_update(job_id, status="processing", stage="Extracting audio and converting to MP3", progress=95)
-            subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(audio_source), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", str(final_path)], check=True, timeout=900)
+            _job_update(job_id, status="processing", stage="Extracting audio and converting to " + request_data["output"].upper(), progress=95)
+            if request_data["output"] == "mp3":
+                audio_args = ["-vn", "-c:a", "libmp3lame", "-b:a", "192k"]
+            elif request_data["output"] == "webm":
+                audio_args = ["-vn", "-c:a", "libopus", "-b:a", "128k"]
+            else:
+                audio_args = ["-vn", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"]
+            subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(audio_source)] + audio_args + [str(final_path)], check=True, timeout=900)
         elif selected.get("has_audio"):
-            _job_update(job_id, status="processing", stage="Finalising MP4", progress=95)
-            subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path), "-c", "copy", "-movflags", "+faststart", str(final_path)], check=True, timeout=900)
+            _job_update(job_id, status="processing", stage="Finalising " + request_data["output"].upper(), progress=95)
+            if request_data["output"] == "mp4":
+                output_args = ["-c", "copy", "-movflags", "+faststart"]
+            elif request_data["output"] == "webm":
+                output_args = ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "6", "-crf", "32", "-b:v", "0", "-c:a", "libopus"]
+            else:
+                raise RuntimeError("MP3 output requires audio mode.")
+            subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path)] + output_args + [str(final_path)], check=True, timeout=1800)
         else:
+            if request_data["output"] != "mp4":
+                raise RuntimeError("Adaptive video-only streams currently support MP4 output only; choose a combined stream for WebM.")
             audio_candidates = [f for f in formats if f.get("has_audio") and not f.get("has_video") and f.get("_direct_url")]
             if not audio_candidates:
                 raise RuntimeError("Video stream was downloaded, but YouTube did not provide a direct audio stream for merging.")
@@ -232,7 +248,7 @@ def create_download_job(payload: DownloadRequest):
     with JOBS_LOCK:
         if sum(1 for item in JOBS.values() if item.get("status") in {"queued", "extracting", "downloading", "processing"}) >= 6:
             raise HTTPException(status_code=429, detail="The download queue is full. Try again shortly.")
-        JOBS[job_id] = {"id": job_id, "status": "queued", "stage": "Waiting for download worker", "progress": 0, "created_at": time.time()}
+        JOBS[job_id] = {"id": job_id, "status": "queued", "stage": "Waiting for download worker", "progress": 0, "requested_format": payload.format_id, "requested_output": payload.output, "created_at": time.time()}
         _persist_jobs_locked()
     DOWNLOAD_POOL.submit(_run_download_job, job_id, payload.model_dump())
     return {"ok": True, "job_id": job_id, "status_path": f"/jobs/{job_id}", "download_path": f"/jobs/{job_id}/file"}
@@ -251,7 +267,10 @@ def get_job_file(job_id: str):
         job = JOBS.get(job_id)
         if not job or job.get("status") != "completed":
             raise HTTPException(status_code=409, detail="The download is not ready yet.")
-        path = STORAGE_DIR / f"{job_id}{OUTPUT_FORMATS['mp3'] if job.get('filename', '').endswith('.mp3') else OUTPUT_FORMATS['mp4']}"
+        suffix = Path(job.get("filename", "kangodl.mp4")).suffix.lower()
+        if suffix not in OUTPUT_FORMATS.values():
+            suffix = ".mp4"
+        path = STORAGE_DIR / f"{job_id}{suffix}"
         filename = re.sub(r'[^A-Za-z0-9._ -]', '_', job.get("filename", "kangodl" + path.suffix))[:160]
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Completed file is no longer available.")
@@ -298,7 +317,7 @@ async def convert_media(file_id: str, format: str):
     elif output_format == "mp4":
         args = ("ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(destination))
     else:
-        args = ("ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "32", "-c:a", "libopus", str(destination))
+        args = ("ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "6", "-b:v", "0", "-crf", "32", "-c:a", "libopus", str(destination))
     code, _, _ = await run_media_tool(*args, timeout=1800)
     if code != 0 or not destination.exists() or destination.stat().st_size == 0:
         destination.unlink(missing_ok=True); raise HTTPException(status_code=422, detail="Conversion failed for this input file.")
