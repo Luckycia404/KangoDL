@@ -1,6 +1,6 @@
 from __future__ import annotations
 import asyncio, os, re, uuid, threading, subprocess, json, time, hmac
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.request import Request as URLRequest, urlopen
 from fastapi import FastAPI, File, HTTPException, UploadFile, Request
@@ -36,7 +36,7 @@ def _persist_jobs_locked():
     temporary = JOBS_FILE.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(JOBS), encoding="utf-8")
     temporary.replace(JOBS_FILE)
-app = FastAPI(title="KangoDL Engine", description="Independent media extraction and processing engine.", version="0.7.0")
+app = FastAPI(title="KangoDL Engine", description="Independent media extraction and processing engine.", version="0.8.0")
 API_KEY = os.getenv("KANGODL_API_KEY", "").strip()
 REQUIRE_API_KEY = os.getenv("KANGODL_REQUIRE_API_KEY", "0").lower() in {"1", "true", "yes"}
 
@@ -79,19 +79,74 @@ def _job_update(job_id: str, **values):
             JOBS[job_id].update(values)
             _persist_jobs_locked()
 
-def _download_url(url: str, destination: Path, job_id: str, label: str):
-    user_agents = [
+def _download_url(url: str, destination: Path, job_id: str, label: str, user_agent: str | None = None):
+    user_agents = ([user_agent] if user_agent else []) + [
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
         "com.google.android.youtube/20.10.38 (Linux; U; Android 15) gzip",
         "com.google.ios.youtube/20.10.4",
     ]
     last_error = None
-    for user_agent in user_agents:
-        total = 0
+    chunk_size = 4 * 1024 * 1024
+    range_workers = 4
+
+    for current_ua in dict.fromkeys(user_agents):
         destination.unlink(missing_ok=True)
-        request = URLRequest(url, headers={"User-Agent": user_agent, "Origin": "https://www.youtube.com", "Referer": "https://www.youtube.com/"})
+        base_headers = {
+            "User-Agent": current_ua, "Origin": "https://www.youtube.com",
+            "Referer": "https://www.youtube.com/", "Accept-Encoding": "identity",
+        }
         try:
-            with urlopen(request, timeout=35) as response, destination.open("wb") as out:
+            # Probe byte-range support and learn the exact object size. YouTube's
+            # GVS endpoints often throttle a single long response, while bounded
+            # range requests are reliable and can be safely retried independently.
+            probe = URLRequest(url, headers={**base_headers, "Range": "bytes=0-0"})
+            with urlopen(probe, timeout=35) as response:
+                content_range = response.headers.get("Content-Range", "")
+                match = re.fullmatch(r"bytes 0-0/(\d+)", content_range)
+                if response.status == 206 and match:
+                    total_size = int(match.group(1))
+                    response.read(1)
+                else:
+                    total_size = 0
+            if total_size:
+                if total_size > MAX_DOWNLOAD_BYTES:
+                    raise RuntimeError("Download exceeds the configured 2 GiB safety limit.")
+                with destination.open("wb") as output:
+                    output.truncate(total_size)
+                fd = os.open(destination, os.O_WRONLY)
+                completed = 0
+                try:
+                    def fetch_range(start: int, end: int):
+                        request = URLRequest(url, headers={**base_headers, "Range": f"bytes={start}-{end}"})
+                        with urlopen(request, timeout=60) as response:
+                            expected_range = f"bytes {start}-{end}/{total_size}"
+                            if response.status != 206 or response.headers.get("Content-Range") != expected_range:
+                                raise RuntimeError(f"Media server returned an unexpected range for bytes {start}-{end}.")
+                            data = response.read(end - start + 1)
+                            if len(data) != end - start + 1:
+                                raise RuntimeError(f"Media range was incomplete at byte {start}.")
+                            return start, data
+
+                    ranges = [(start, min(start + chunk_size - 1, total_size - 1)) for start in range(0, total_size, chunk_size)]
+                    with ThreadPoolExecutor(max_workers=range_workers, thread_name_prefix="kangodl-range") as pool:
+                        futures = [pool.submit(fetch_range, start, end) for start, end in ranges]
+                        for future in as_completed(futures):
+                            start, data = future.result()
+                            written = os.pwrite(fd, data, start)
+                            if written != len(data):
+                                raise RuntimeError(f"Could not write the complete media range at byte {start}.")
+                            completed += written
+                            _job_update(job_id, stage=label, bytes_downloaded=completed, progress=round(min(99, completed * 100 / total_size), 1))
+                finally:
+                    os.close(fd)
+                if completed != total_size or destination.stat().st_size != total_size:
+                    raise RuntimeError("The ranged download did not produce the complete media object.")
+                return total_size
+
+            # Some origins do not support byte ranges; use a normal full response.
+            request = URLRequest(url, headers=base_headers)
+            total = 0
+            with urlopen(request, timeout=60) as response, destination.open("wb") as out:
                 expected = int(response.headers.get("Content-Length", "0") or 0)
                 while True:
                     chunk = response.read(1024 * 1024)
@@ -108,6 +163,7 @@ def _download_url(url: str, destination: Path, job_id: str, label: str):
             last_error = RuntimeError("The source returned an empty media stream.")
         except Exception as exc:
             last_error = exc
+            destination.unlink(missing_ok=True)
     raise RuntimeError(f"All direct stream request profiles failed ({type(last_error).__name__}: {last_error}).")
 
 def _run_download_job(job_id: str, request_data: dict):
@@ -147,7 +203,7 @@ def _run_download_job(job_id: str, request_data: dict):
         audio_source = audio_path
         if request_data["mode"] == "audio":
             try:
-                _download_url(selected["_direct_url"], audio_path, job_id, "Downloading audio")
+                _download_url(selected["_direct_url"], audio_path, job_id, "Downloading audio", selected.get("_user_agent"))
             except Exception:
                 # Some public player audio URLs reject full-object reads. Fall back
                 # to a muxed stream when one is available, then extract its audio.
@@ -157,11 +213,11 @@ def _run_download_job(job_id: str, request_data: dict):
                     raise
                 fallback = max(muxed, key=lambda f: (f.get("height") or 0, f.get("bitrate") or 0))
                 _job_update(job_id, stage="Audio stream unavailable; downloading combined stream", selected_format=fallback["format_id"], progress=2)
-                _download_url(fallback["_direct_url"], video_path, job_id, "Downloading combined stream")
+                _download_url(fallback["_direct_url"], video_path, job_id, "Downloading combined stream", fallback.get("_user_agent"))
                 audio_source = video_path
         else:
             try:
-                _download_url(selected["_direct_url"], video_path, job_id, "Downloading video")
+                _download_url(selected["_direct_url"], video_path, job_id, "Downloading video", selected.get("_user_agent"))
             except Exception as stream_error:
                 if selected.get("has_audio"):
                     raise
@@ -176,7 +232,7 @@ def _run_download_job(job_id: str, request_data: dict):
                 )
                 _job_update(job_id, status="downloading", stage="Adaptive video unavailable; switching to combined stream", selected_format=fallback["format_id"], fallback_reason=fallback_reason)
                 selected = fallback
-                _download_url(selected["_direct_url"], video_path, job_id, "Downloading combined fallback")
+                _download_url(selected["_direct_url"], video_path, job_id, "Downloading combined fallback", selected.get("_user_agent"))
         if request_data["mode"] == "audio":
             _job_update(job_id, status="processing", stage="Extracting audio and converting to " + request_data["output"].upper(), progress=95)
             if request_data["output"] == "mp3":
@@ -196,15 +252,16 @@ def _run_download_job(job_id: str, request_data: dict):
                 raise RuntimeError("MP3 output requires audio mode.")
             subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path)] + output_args + [str(final_path)], check=True, timeout=1800)
         else:
-            if request_data["output"] != "mp4":
-                raise RuntimeError("Adaptive video-only streams currently support MP4 output only; choose a combined stream for WebM.")
+            if request_data["output"] not in {"mp4", "webm"}:
+                raise RuntimeError("Video downloads support MP4 or WebM output; use audio mode for MP3.")
             audio_candidates = [f for f in formats if f.get("has_audio") and not f.get("has_video") and f.get("_direct_url")]
             if not audio_candidates:
                 raise RuntimeError("Video stream was downloaded, but YouTube did not provide a direct audio stream for merging.")
-            audio = max(audio_candidates, key=lambda f: f.get("bitrate") or 0)
+            preferred_audio_mime = "audio/mp4" if request_data["output"] == "mp4" else "audio/webm"
+            audio = max(audio_candidates, key=lambda f: (f.get("mime_type") == preferred_audio_mime, f.get("bitrate") or 0))
             _job_update(job_id, stage="Downloading audio stream for merge", progress=55)
             try:
-                _download_url(audio["_direct_url"], audio_path, job_id, "Downloading audio stream for merge")
+                _download_url(audio["_direct_url"], audio_path, job_id, "Downloading audio stream for merge", audio.get("_user_agent"))
             except Exception:
                 # If the adaptive audio URL is denied by the CDN, fall back
                 # to the best directly downloadable muxed format at or below
@@ -215,12 +272,21 @@ def _run_download_job(job_id: str, request_data: dict):
                     raise RuntimeError("The separate audio stream was blocked and no combined audio/video fallback is available.")
                 fallback = max((f for f in fallback_candidates if (f.get("height") or 0) <= (selected.get("height") or 0)), key=lambda f: f.get("height") or 0, default=max(fallback_candidates, key=lambda f: f.get("height") or 0))
                 _job_update(job_id, status="downloading", stage="Adaptive audio unavailable; switching to combined stream", selected_format=fallback["format_id"], progress=5)
-                _download_url(fallback["_direct_url"], video_path, job_id, "Downloading combined fallback")
+                _download_url(fallback["_direct_url"], video_path, job_id, "Downloading combined fallback", fallback.get("_user_agent"))
                 _job_update(job_id, status="processing", stage="Finalising combined MP4", progress=95)
                 subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path), "-c", "copy", "-movflags", "+faststart", str(final_path)], check=True, timeout=900)
             else:
                 _job_update(job_id, status="processing", stage="Merging video and audio", progress=92)
-                subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path), "-i", str(audio_path), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(final_path)], check=True, timeout=1800)
+                if request_data["output"] == "mp4":
+                    merge_args = ["-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart"]
+                elif selected.get("mime_type") == "video/webm" and audio.get("mime_type") == "audio/webm":
+                    # Keep native VP9/Opus streams in their original WebM container.
+                    merge_args = ["-c", "copy"]
+                elif "opus" in (audio.get("codecs") or "").lower():
+                    merge_args = ["-c:v", "libvpx", "-deadline", "realtime", "-cpu-used", "8", "-crf", "32", "-b:v", "0", "-c:a", "copy"]
+                else:
+                    merge_args = ["-c:v", "libvpx", "-deadline", "realtime", "-cpu-used", "8", "-crf", "32", "-b:v", "0", "-c:a", "libopus", "-b:a", "128k"]
+                subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path), "-i", str(audio_path)] + merge_args + [str(final_path)], check=True, timeout=1800)
         if not final_path.exists() or final_path.stat().st_size == 0:
             raise RuntimeError("The media processor did not produce a valid output file.")
         _job_update(job_id, status="completed", stage="Ready", progress=100, bytes=final_path.stat().st_size, download_path=f"/jobs/{job_id}/file", filename=(info.get("title") or "kangodl") + final_path.suffix)

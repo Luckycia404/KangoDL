@@ -16,8 +16,8 @@ Tokens are content-bound to the supplied video ID. The service caches its integr
 
 Build this directory as its own container. Set `KANGODL_POT_SECRET` as a runtime secret. Do not expose port 8878 publicly; keep it on a private container network. The default host is loopback for same-machine use; set `POT_HOST=0.0.0.0` only when a private container network requires it.
 
-## Verification and current limitation
+## Verification and current role
 
-The provider successfully generated a 116-character GVS content-bound token for the user's public test video. However, the current VPS's YouTube MWEB player request returned `UNPLAYABLE` with a reload-required response, while Android player requests returned formats. A Web PO token must not be assumed interchangeable with Android/iOS tokens. For that reason, this service is kept separate and is not falsely wired into the Android extractor. Higher-resolution delivery remains unverified until a compatible MWEB/Web player response and full media download both succeed.
+The provider successfully generated a video-bound Web GVS token for the public test video. The main KangoDL extractor now prefers the VISIONOS player flow, which has been verified for full 1080p and 720p MP4 delivery on that test asset. This sidecar remains an optional, separate component for future Web-client experiments; its Web token must not be attached to Android, iOS, or VISIONOS stream URLs. It is not required by the current main API path.
 
 `bgutils-js` is MIT-licensed and maintained independently. YouTube may change the attestation flow at any time.
