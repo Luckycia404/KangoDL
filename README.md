@@ -37,6 +37,8 @@ Build with `docker build -t kangodl-engine .`. Set a strong `KANGODL_API_KEY`, c
 
 The current download worker is in-process and single-concurrency. Persisted job records survive restarts, but active downloads are marked interrupted instead of resumed. For multi-replica production, move jobs and media state to shared durable storage and a queue.
 
+On the working VPS, both API processes are managed by enabled systemd services (`kangodl-engine.service` and `kangodl-pot.service`) and bind to loopback only. Their unit files are included in `deploy/systemd/`; the PO token service reads its private `.secret` file at startup. The public API has not been exposed through a reverse proxy or domain yet.
+
 
 ## Optional Web PO Token sidecar
 
