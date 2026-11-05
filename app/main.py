@@ -175,7 +175,7 @@ def _run_download_job(job_id: str, request_data: dict):
             if request_data["output"] == "mp4":
                 output_args = ["-c", "copy", "-movflags", "+faststart"]
             elif request_data["output"] == "webm":
-                output_args = ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "6", "-crf", "32", "-b:v", "0", "-c:a", "libopus"]
+                output_args = ["-c:v", "libvpx", "-deadline", "realtime", "-cpu-used", "8", "-crf", "32", "-b:v", "0", "-c:a", "libopus"]
             else:
                 raise RuntimeError("MP3 output requires audio mode.")
             subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path)] + output_args + [str(final_path)], check=True, timeout=1800)
@@ -317,7 +317,7 @@ async def convert_media(file_id: str, format: str):
     elif output_format == "mp4":
         args = ("ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(destination))
     else:
-        args = ("ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "6", "-b:v", "0", "-crf", "32", "-c:a", "libopus", str(destination))
+        args = ("ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-c:v", "libvpx", "-deadline", "realtime", "-cpu-used", "8", "-b:v", "0", "-crf", "32", "-c:a", "libopus", str(destination))
     code, _, _ = await run_media_tool(*args, timeout=1800)
     if code != 0 or not destination.exists() or destination.stat().st_size == 0:
         destination.unlink(missing_ok=True); raise HTTPException(status_code=422, detail="Conversion failed for this input file.")
