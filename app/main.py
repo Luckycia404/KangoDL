@@ -136,7 +136,7 @@ def _run_download_job(job_id: str, request_data: dict):
             muxed_candidates = [f for f in video_candidates if f.get("has_audio")]
             selected = max(muxed_candidates or video_candidates, key=lambda f: f.get("height") or 0)
         if not selected or not selected.get("_direct_url"):
-            raise RuntimeError("That format is not directly downloadable at this time. Choose a format marked downloadable_now.")
+            raise RuntimeError("That format is not directly downloadable at this time. Choose a format with a direct stream URL.")
         if request_data["mode"] == "audio" and not selected.get("has_audio"):
             raise RuntimeError("The selected format does not contain audio.")
         if request_data["mode"] == "video" and not selected.get("has_video"):
@@ -173,8 +173,6 @@ def _run_download_job(job_id: str, request_data: dict):
             _job_update(job_id, stage="Downloading audio stream for merge", progress=55)
             try:
                 _download_url(audio["_direct_url"], audio_path, job_id, "Downloading audio stream for merge")
-                _job_update(job_id, status="processing", stage="Merging video and audio", progress=92)
-                subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path), "-i", str(audio_path), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(final_path)], check=True, timeout=1800)
             except Exception:
                 # If the adaptive audio URL is denied by the CDN, fall back
                 # to the best directly downloadable muxed format at or below
@@ -188,6 +186,9 @@ def _run_download_job(job_id: str, request_data: dict):
                 _download_url(fallback["_direct_url"], video_path, job_id, "Downloading combined fallback")
                 _job_update(job_id, status="processing", stage="Finalising combined MP4", progress=95)
                 subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path), "-c", "copy", "-movflags", "+faststart", str(final_path)], check=True, timeout=900)
+            else:
+                _job_update(job_id, status="processing", stage="Merging video and audio", progress=92)
+                subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path), "-i", str(audio_path), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(final_path)], check=True, timeout=1800)
         if not final_path.exists() or final_path.stat().st_size == 0:
             raise RuntimeError("The media processor did not produce a valid output file.")
         _job_update(job_id, status="completed", stage="Ready", progress=100, bytes=final_path.stat().st_size, download_path=f"/jobs/{job_id}/file", filename=(info.get("title") or "kangodl") + final_path.suffix)
