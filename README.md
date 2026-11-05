@@ -1,0 +1,38 @@
+# KangoDL Engine
+
+KangoDL is an independently developed media extraction and processing API. Platform-specific extraction logic is written in KangoDL modules. yt-dlp is not installed or used by the runtime.
+
+## API
+
+- `GET /health` — public health check.
+- `GET /info?url=...` — metadata and normalized public stream formats.
+- `POST /jobs` — start a download job. JSON: `{"url":"https://youtu.be/VIDEO_ID","format_id":"18","mode":"video","output":"mp4"}`.
+- `GET /jobs/{job_id}` — job status and progress.
+- `GET /jobs/{job_id}/file` — retrieve a completed file.
+- `POST /media`, `GET /media/{id}/probe`, `POST /media/{id}/convert?format=mp3|mp4|webm`, `GET /media/{id}` — local authorized-file processing.
+
+Send the API key in `X-API-Key` or `Authorization: Bearer <key>`. Docker images require `KANGODL_API_KEY` to be set before protected routes become available. The health route remains public.
+
+## Extractor architecture and current verification
+
+- `app/extractors/youtube.py` implements KangoDL's YouTube URL parsing, public-page configuration reader, player API client, and format normalizer.
+- Direct muxed MP4 download and HTTP file delivery were verified against the owner's public test upload (360p, 18.5 MB, 10m51s).
+- MP3 extraction and HTTP file delivery were also verified (15.6 MB, 10m51s). YouTube's tested standalone adaptive audio URL rejects full-object reads, so KangoDL falls back to downloading the available muxed stream and extracting its audio with FFmpeg.
+- /info now labels each format as muxed, video_only, or audio_only, and exposes ready_for_direct_video_download so clients can distinguish a complete A/V stream from a video-only adaptive stream. The default video job prefers a muxed stream. If an explicitly selected adaptive video stream cannot obtain its separate audio stream, the job falls back to the best available muxed stream rather than silently claiming the requested resolution succeeded. On the test video, 720p/1080p adaptive audio URLs are still blocked, so higher-resolution output is not claimed as working.
+- Formats requiring signature deciphering or other unavailable player data are not supported yet.
+- This engine does not bypass DRM, private-video restrictions, paid access, or other access controls. Use it only for content the caller owns or is authorized to download.
+
+## Local run
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+## Docker / Northflank
+
+Build with `docker build -t kangodl-engine .`. Set a strong `KANGODL_API_KEY`, configure `PORT` if needed, and mount persistent storage at `/app/storage`. The image uses Python 3.12, FFmpeg, a non-root user, and a health check. Store the API key as a secret, not in source control.
+
+The current download worker is in-process and single-concurrency. Persisted job records survive restarts, but active downloads are marked interrupted instead of resumed. For multi-replica production, move jobs and media state to shared durable storage and a queue.
