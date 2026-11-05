@@ -162,14 +162,19 @@ def _run_download_job(job_id: str, request_data: dict):
         else:
             try:
                 _download_url(selected["_direct_url"], video_path, job_id, "Downloading video")
-            except Exception:
+            except Exception as stream_error:
                 if selected.get("has_audio"):
                     raise
                 fallback_candidates = [f for f in formats if f.get("has_video") and f.get("has_audio") and f.get("_direct_url")]
                 if not fallback_candidates:
                     raise RuntimeError("The selected video stream was blocked and no combined audio/video fallback is available.")
                 fallback = max((f for f in fallback_candidates if (f.get("height") or 0) <= (selected.get("height") or 0)), key=lambda f: f.get("height") or 0, default=max(fallback_candidates, key=lambda f: f.get("height") or 0))
-                _job_update(job_id, status="downloading", stage="Adaptive video unavailable; switching to combined stream", selected_format=fallback["format_id"], fallback_reason="Requested video stream returned an error")
+                fallback_reason = (
+                    "YouTube returned HTTP 403 for the adaptive stream; a GVS PO Token may be required"
+                    if getattr(stream_error, "code", None) == 403 or "HTTP Error 403" in str(stream_error)
+                    else f"Requested adaptive stream failed ({type(stream_error).__name__})"
+                )
+                _job_update(job_id, status="downloading", stage="Adaptive video unavailable; switching to combined stream", selected_format=fallback["format_id"], fallback_reason=fallback_reason)
                 selected = fallback
                 _download_url(selected["_direct_url"], video_path, job_id, "Downloading combined fallback")
         if request_data["mode"] == "audio":
