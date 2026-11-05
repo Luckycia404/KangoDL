@@ -4,3 +4,6 @@ __pycache__/
 *.py[cod]
 storage/*
 !storage/.gitkeep
+node_modules/
+token-provider/.env
+token-provider/.secret

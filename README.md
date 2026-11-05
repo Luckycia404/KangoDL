@@ -36,3 +36,10 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 Build with `docker build -t kangodl-engine .`. Set a strong `KANGODL_API_KEY`, configure `PORT` if needed, and mount persistent storage at `/app/storage`. The image uses Python 3.12, FFmpeg, a non-root user, and a health check. Store the API key as a secret, not in source control.
 
 The current download worker is in-process and single-concurrency. Persisted job records survive restarts, but active downloads are marked interrupted instead of resumed. For multi-replica production, move jobs and media state to shared durable storage and a queue.
+
+
+## Optional Web PO Token sidecar
+
+A standalone Node.js service is available in `token-provider/`. It uses `bgutils-js` to mint video-bound Web GVS PO tokens and is intentionally separate from the Python extractor. It is not yt-dlp and does not add yt-dlp to the engine.
+
+The provider is currently a verified token-generation component, not an enabled high-resolution download path: YouTube's MWEB player endpoint returned a reload-required `UNPLAYABLE` response from this VPS, and Web tokens must not be treated as Android/iOS tokens. The extractor therefore retains its verified Android/iOS behavior and existing fallback rather than attaching an incompatible token. See `token-provider/README.md` for setup and deployment.
