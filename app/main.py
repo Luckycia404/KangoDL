@@ -160,7 +160,18 @@ def _run_download_job(job_id: str, request_data: dict):
                 _download_url(fallback["_direct_url"], video_path, job_id, "Downloading combined stream")
                 audio_source = video_path
         else:
-            _download_url(selected["_direct_url"], video_path, job_id, "Downloading video")
+            try:
+                _download_url(selected["_direct_url"], video_path, job_id, "Downloading video")
+            except Exception:
+                if selected.get("has_audio"):
+                    raise
+                fallback_candidates = [f for f in formats if f.get("has_video") and f.get("has_audio") and f.get("_direct_url")]
+                if not fallback_candidates:
+                    raise RuntimeError("The selected video stream was blocked and no combined audio/video fallback is available.")
+                fallback = max((f for f in fallback_candidates if (f.get("height") or 0) <= (selected.get("height") or 0)), key=lambda f: f.get("height") or 0, default=max(fallback_candidates, key=lambda f: f.get("height") or 0))
+                _job_update(job_id, status="downloading", stage="Adaptive video unavailable; switching to combined stream", selected_format=fallback["format_id"], fallback_reason="Requested video stream returned an error")
+                selected = fallback
+                _download_url(selected["_direct_url"], video_path, job_id, "Downloading combined fallback")
         if request_data["mode"] == "audio":
             _job_update(job_id, status="processing", stage="Extracting audio and converting to " + request_data["output"].upper(), progress=95)
             if request_data["output"] == "mp3":
