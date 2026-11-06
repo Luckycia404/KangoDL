@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, os, re, uuid, threading, subprocess, json, time, hmac
+import asyncio, os, re, uuid, threading, subprocess, json, time, hmac, secrets, http.cookiejar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.request import Request as URLRequest, urlopen
@@ -7,6 +7,18 @@ from fastapi import FastAPI, File, HTTPException, UploadFile, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from app.extractors.youtube import ExtractorError, extract_youtube_info, video_id_from_url
+from app.extractors.tiktok import is_tiktok_url, extract_tiktok_info, download_tiktok, download_tiktok_photos
+from app.extractors.pornhub import is_pornhub_url, extract_pornhub_info, download_pornhub
+from app.extractors.pornhub_search import search_pornhub
+from app.extractors.pinterest import is_pinterest_url, extract_pinterest_info, download_pinterest
+from app.extractors.pinterest_search import search_pinterest
+from app.extractors.audiomack import is_audiomack_url, extract_audiomack_info, search_audiomack, download_audiomack
+from app.extractors.instagram import is_instagram_url, extract_instagram_info, download_instagram
+from app.extractors.snapchat import is_snapchat_url, extract_snapchat_info, download_snapchat
+from app.extractors.facebook import is_facebook_url, extract_facebook_info, download_facebook
+from app.extractors.x import is_x_url, extract_x_info, download_x
+from app.extractors.reddit import is_reddit_url, extract_reddit_info, download_reddit
+from app.extractors.strategy import STRATEGIES
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STORAGE_DIR = Path(os.getenv("KANGODL_STORAGE", str(BASE_DIR / "storage"))).resolve()
@@ -57,13 +69,122 @@ async def api_key_guard(request: Request, call_next):
             return JSONResponse(status_code=401, content={"detail": "A valid API key is required."})
     return await call_next(request)
 
-OUTPUT_FORMATS = {"mp3": ".mp3", "mp4": ".mp4", "webm": ".webm"}
+
+AUTH_DIR = (STORAGE_DIR / "auth").resolve()
+AUTH_DIR.mkdir(parents=True, exist_ok=True)
+os.chmod(AUTH_DIR, 0o700)
+YOUTUBE_COOKIE_PATH = AUTH_DIR / "youtube.cookies"
+AUTH_FIELDS = {
+    "reddit": {"REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_USER_AGENT"},
+    "pinterest": {"PINTEREST_ACCESS_TOKEN"},
+    "audiomack": {"AUDIOMACK_CONSUMER_KEY", "AUDIOMACK_CONSUMER_SECRET"},
+}
+AUTH_STATUS_FIELDS = {
+    "reddit": ("REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"),
+    "pinterest": ("PINTEREST_ACCESS_TOKEN",),
+    "audiomack": ("AUDIOMACK_CONSUMER_KEY", "AUDIOMACK_CONSUMER_SECRET"),
+}
+
+def _auth_admin(request: Request):
+    if not API_KEY:
+        raise HTTPException(status_code=503, detail="Set KANGODL_API_KEY in the service .env before using authentication settings.")
+    supplied = request.headers.get("x-api-key", "")
+    authorization = request.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        supplied = authorization[7:].strip()
+    if not hmac.compare_digest(supplied, API_KEY):
+        raise HTTPException(status_code=401, detail="A valid API key is required.")
+
+def _write_env_values(values: dict[str, str]):
+    env_path = BASE_DIR / ".env"
+    current = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    updates = {k: json.dumps(v, ensure_ascii=True) for k, v in values.items()}
+    seen = set()
+    output = []
+    for line in current:
+        stripped = line.strip()
+        key = stripped.split("=", 1)[0].strip() if "=" in stripped and not stripped.startswith("#") else None
+        if key in updates:
+            if key not in seen:
+                output.append(f"{key}={updates[key]}")
+                seen.add(key)
+        else:
+            output.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            output.append(f"{key}={value}")
+    temporary = env_path.with_suffix(".env.tmp")
+    temporary.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    temporary.replace(env_path)
+    os.chmod(env_path, 0o600)
+
+@app.get("/auth/status")
+def auth_status(request: Request):
+    _auth_admin(request)
+    platforms = {}
+    for platform, fields in AUTH_STATUS_FIELDS.items():
+        platforms[platform] = {"configured": all(bool(os.getenv(field, "").strip()) for field in fields), "fields": list(fields)}
+    platforms["youtube"] = {"configured": YOUTUBE_COOKIE_PATH.is_file() and YOUTUBE_COOKIE_PATH.stat().st_size > 0, "method": "Netscape cookie file"}
+    for platform in ("tiktok", "instagram", "facebook", "x", "snapchat", "pornhub"):
+        platforms[platform] = {"configured": False, "method": "No supported account-auth integration; public extraction only"}
+    return {"ok": True, "platforms": platforms, "restart_required_after_changes": True}
+
+@app.put("/auth/credentials/{platform}")
+def save_platform_credentials(platform: str, payload: dict, request: Request):
+    _auth_admin(request)
+    allowed = AUTH_FIELDS.get(platform.lower())
+    if not allowed:
+        raise HTTPException(status_code=400, detail="Supported credential profiles: reddit, pinterest, audiomack.")
+    if not isinstance(payload, dict) or not payload:
+        raise HTTPException(status_code=400, detail="Provide at least one supported credential field.")
+    if set(payload) - allowed:
+        raise HTTPException(status_code=400, detail="One or more credential fields are not supported for this platform.")
+    values = {}
+    for key, value in payload.items():
+        if not isinstance(value, str) or not value.strip() or "\n" in value or "\r" in value:
+            raise HTTPException(status_code=400, detail=f"{key} must be a non-empty single-line string.")
+        values[key] = value.strip()
+    _write_env_values(values)
+    return {"ok": True, "platform": platform.lower(), "saved_fields": sorted(values), "secrets_returned": False, "restart_required": True}
+
+@app.post("/auth/youtube/cookies")
+async def upload_youtube_cookies(request: Request, file: UploadFile = File(...)):
+    _auth_admin(request)
+    raw = await file.read(1_048_577)
+    await file.close()
+    if not raw or len(raw) > 1_048_576:
+        raise HTTPException(status_code=413, detail="Cookie file must be between 1 byte and 1 MiB.")
+    temporary = AUTH_DIR / "youtube.cookies.upload"
+    try:
+        temporary.write_bytes(raw)
+        os.chmod(temporary, 0o600)
+        jar = http.cookiejar.MozillaCookieJar(str(temporary))
+        jar.load(ignore_discard=True, ignore_expires=False)
+        if not list(jar):
+            raise ValueError("No valid, unexpired cookies were found.")
+        os.replace(temporary, YOUTUBE_COOKIE_PATH)
+        os.chmod(YOUTUBE_COOKIE_PATH, 0o600)
+        _write_env_values({"KANGODL_YOUTUBE_COOKIE_FILE": str(YOUTUBE_COOKIE_PATH)})
+    except Exception as exc:
+        temporary.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail="Invalid Netscape/Mozilla cookie file or no usable cookies.") from exc
+    return {"ok": True, "platform": "youtube", "cookie_count": len(list(jar)), "secrets_returned": False, "restart_required": True}
+
+@app.delete("/auth/youtube/cookies")
+def delete_youtube_cookies(request: Request):
+    _auth_admin(request)
+    YOUTUBE_COOKIE_PATH.unlink(missing_ok=True)
+    _write_env_values({"KANGODL_YOUTUBE_COOKIE_FILE": ""})
+    return {"ok": True, "platform": "youtube", "cookies_removed": True, "restart_required": True}
+
+OUTPUT_FORMATS = {"mp3": ".mp3", "mp4": ".mp4", "webm": ".webm", "zip": ".zip", "jpg": ".jpg"}
 
 class DownloadRequest(BaseModel):
     url: str
     format_id: str | None = None
-    mode: str = Field(default="video", pattern="^(video|audio)$")
-    output: str = Field(default="mp4", pattern="^(mp4|mp3|webm)$")
+    mode: str = Field(default="video", pattern="^(video|audio|photos|image)$")
+    output: str = Field(default="mp4", pattern="^(mp4|mp3|webm|zip|jpg)$")
 
 def resolve_media(file_id: str) -> Path:
     if not re.fullmatch(r"[a-f0-9]{32}", file_id):
@@ -172,6 +293,116 @@ def _run_download_job(job_id: str, request_data: dict):
     audio_path = STORAGE_DIR / f"{work_id}.audio.part"
     final_path = STORAGE_DIR / f"{work_id}{OUTPUT_FORMATS[request_data['output']]}"
     try:
+        if is_reddit_url(request_data["url"]):
+            _job_update(job_id, status="extracting", stage="Resolving public Reddit post", progress=1)
+            def reddit_progress(data):
+                if data.get("status") == "downloading":
+                    total = data.get("total_bytes") or 0
+                    downloaded = data.get("downloaded_bytes") or 0
+                    _job_update(job_id, status="downloading", stage="Downloading Reddit media", bytes_downloaded=downloaded, progress=round(min(94, downloaded * 94 / total), 1) if total else 5)
+            result = download_reddit(request_data["url"], final_path, request_data["mode"], request_data["output"], reddit_progress, request_data.get("format_id"))
+            _job_update(job_id, status="completed", stage="Ready", progress=100, bytes=result["bytes"], selected_format=result["format_id"], title=result.get("title"), author=result.get("author"), thumbnail=result.get("thumbnail"), duration_seconds=result.get("duration_seconds"), media_type=result.get("media_type", "video"), item_count=result.get("item_count", 1), download_path=f"/jobs/{job_id}/file", filename=(result.get("title") or "kangodl-reddit") + final_path.suffix, extraction_method=result.get("extraction_method"))
+            return
+        if is_x_url(request_data["url"]):
+            _job_update(job_id, status="extracting", stage="Resolving public X video", progress=1)
+            def x_progress(data):
+                if data.get("status") == "downloading":
+                    total = data.get("total_bytes") or 0
+                    downloaded = data.get("downloaded_bytes") or 0
+                    _job_update(job_id, status="downloading", stage="Downloading X video", bytes_downloaded=downloaded, progress=round(min(94, downloaded * 94 / total), 1) if total else 5)
+            _job_update(job_id, status="downloading", stage="Downloading X video", progress=2)
+            result = download_x(request_data["url"], final_path, request_data["mode"], request_data["output"], x_progress, request_data.get("format_id"))
+            _job_update(job_id, status="completed", stage="Ready", progress=100, bytes=result["bytes"], selected_format=result["format_id"], title=result.get("title"), author=result.get("author"), thumbnail=result.get("thumbnail"), duration_seconds=result.get("duration_seconds"), media_type="video", download_path=f"/jobs/{job_id}/file", filename=(result.get("title") or "kangodl-x") + final_path.suffix, extraction_method=result.get("extraction_method"))
+            return
+        if is_facebook_url(request_data["url"]):
+            _job_update(job_id, status="extracting", stage="Resolving public Facebook video", progress=1)
+            def facebook_progress(data):
+                if data.get("status") == "downloading":
+                    total = data.get("total_bytes") or 0
+                    downloaded = data.get("downloaded_bytes") or 0
+                    _job_update(job_id, status="downloading", stage="Downloading Facebook video", bytes_downloaded=downloaded, progress=round(min(94, downloaded * 94 / total), 1) if total else 5)
+            _job_update(job_id, status="downloading", stage="Downloading Facebook video", progress=2)
+            result = download_facebook(request_data["url"], final_path, request_data["mode"], request_data["output"], facebook_progress)
+            _job_update(job_id, status="completed", stage="Ready", progress=100, bytes=result["bytes"], selected_format=result["format_id"], title=result.get("title"), thumbnail=result.get("thumbnail"), media_type="video", download_path=f"/jobs/{job_id}/file", filename=(result.get("title") or "kangodl-facebook") + final_path.suffix, extraction_method=result.get("extraction_method"))
+            return
+        if is_snapchat_url(request_data["url"]):
+            _job_update(job_id, status="extracting", stage="Resolving public Snapchat Spotlight", progress=1)
+            def snapchat_progress(data):
+                if data.get("status") == "downloading":
+                    total = data.get("total_bytes") or 0
+                    downloaded = data.get("downloaded_bytes") or 0
+                    _job_update(job_id, status="downloading", stage="Downloading Snapchat Spotlight", bytes_downloaded=downloaded, progress=round(min(90, downloaded * 90 / total), 1) if total else 5)
+            _job_update(job_id, status="downloading", stage="Downloading Snapchat Spotlight", progress=2)
+            result = download_snapchat(request_data["url"], final_path, request_data["mode"], request_data["output"], snapchat_progress)
+            _job_update(job_id, status="completed", stage="Ready", progress=100, bytes=result["bytes"], selected_format=result["format_id"], title=result.get("title"), thumbnail=result.get("thumbnail"), media_type="video", download_path=f"/jobs/{job_id}/file", filename=(result.get("title") or "kangodl-snapchat") + final_path.suffix, extraction_method=result.get("extraction_method"))
+            return
+        if is_instagram_url(request_data["url"]):
+            _job_update(job_id, status="extracting", stage="Resolving public Instagram media", progress=1)
+            def instagram_progress(data):
+                if data.get("status") == "downloading":
+                    total = data.get("total_bytes") or 0
+                    downloaded = data.get("downloaded_bytes") or 0
+                    _job_update(job_id, status="downloading", stage="Downloading Instagram media", bytes_downloaded=downloaded, progress=round(min(90, downloaded * 90 / total), 1) if total else 5)
+            _job_update(job_id, status="downloading", stage="Downloading Instagram media", progress=2)
+            result = download_instagram(request_data["url"], final_path, request_data["mode"], request_data["output"], instagram_progress)
+            _job_update(job_id, status="completed", stage="Ready", progress=100, bytes=result["bytes"], selected_format=result["format_id"], title=result.get("title"), thumbnail=result.get("thumbnail"), media_type=result.get("media_type"), item_count=result.get("item_count"), download_path=f"/jobs/{job_id}/file", filename=(result.get("title") or "kangodl-instagram") + final_path.suffix, extraction_method=result.get("extraction_method"))
+            return
+        if is_pinterest_url(request_data["url"]):
+            _job_update(job_id, status="extracting", stage="Resolving Pinterest pin", progress=1)
+            def pinterest_progress(data):
+                if data.get("status") == "downloading":
+                    total = data.get("total_bytes") or 0; downloaded = data.get("downloaded_bytes") or 0
+                    _job_update(job_id, progress=round(min(94, downloaded * 94 / total), 1) if total else 5, bytes_downloaded=downloaded)
+            _job_update(job_id, status="downloading", stage="Downloading Pinterest media", progress=2)
+            result = download_pinterest(request_data["url"], final_path, request_data["mode"], request_data["output"], pinterest_progress)
+            _job_update(job_id, status="completed", stage="Ready", progress=100, bytes=result["bytes"], selected_format=result["format_id"], title=result.get("title"), thumbnail=result.get("thumbnail"), duration_seconds=result.get("duration_seconds"), media_type=result.get("media_type"), download_path=f"/jobs/{job_id}/file", filename=(result.get("title") or "kangodl-pinterest") + final_path.suffix, extraction_method=result.get("extraction_method"))
+            return
+        if is_pornhub_url(request_data["url"]):
+            def pornhub_progress(data):
+                if data.get("status") == "resolved":
+                    _job_update(job_id, status="downloading", stage="Downloading resolved Pornhub stream", progress=2, title=data.get("title"))
+                elif data.get("status") == "downloading":
+                    total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+                    downloaded = data.get("downloaded_bytes") or 0
+                    percent = data.get("progress")
+                    if percent is None:
+                        percent = round(min(94, downloaded * 94 / total), 1) if total else 5
+                    _job_update(job_id, progress=max(2, percent), bytes_downloaded=downloaded)
+            _job_update(job_id, status="extracting", stage="Resolving public Pornhub stream", progress=1)
+            result = download_pornhub(request_data["url"], final_path, request_data["mode"], request_data["output"], pornhub_progress, request_data.get("format_id"))
+            _job_update(job_id, status="completed", stage="Ready", progress=100, bytes=result["bytes"], selected_format=result["format_id"], title=result.get("title"), author=result.get("author"), thumbnail=result.get("thumbnail"), duration_seconds=result.get("duration_seconds"), download_path=f"/jobs/{job_id}/file", filename=(result.get("title") or "kangodl-pornhub") + final_path.suffix, extraction_method=result.get("extraction_method"))
+            return
+        if is_audiomack_url(request_data["url"]):
+            _job_update(job_id, status="extracting", stage="Resolving Audiomack track", progress=1)
+            def audiomack_progress(data):
+                if data.get("status") == "downloading":
+                    total = data.get("total_bytes") or 0
+                    downloaded = data.get("downloaded_bytes") or 0
+                    _job_update(job_id, status="downloading", stage="Downloading Audiomack audio", bytes_downloaded=downloaded, progress=round(min(90, downloaded * 90 / total), 1) if total else 5)
+            _job_update(job_id, status="downloading", stage="Downloading Audiomack audio", progress=2)
+            result = download_audiomack(request_data["url"], final_path, request_data["output"], audiomack_progress)
+            _job_update(job_id, status="completed", stage="Ready", progress=100, bytes=result["bytes"], selected_format=result["format_id"], title=result.get("title"), author=result.get("author"), thumbnail=result.get("thumbnail"), duration_seconds=result.get("duration_seconds"), media_type="audio", download_path=f"/jobs/{job_id}/file", filename=(result.get("title") or "kangodl-audiomack") + final_path.suffix, extraction_method=result.get("extraction_method"))
+            return
+        if is_tiktok_url(request_data["url"]):
+            if request_data["mode"] == "photos":
+                if request_data["output"] != "zip":
+                    raise RuntimeError("TikTok photo mode requires ZIP output.")
+                _job_update(job_id, status="extracting", stage="Resolving TikTok photo slideshow", progress=1)
+                result = download_tiktok_photos(request_data["url"], final_path)
+                _job_update(job_id, status="completed", stage="Ready", progress=100, bytes=result["bytes"], photo_count=result["photo_count"], selected_format=result["format_id"], download_path=f"/jobs/{job_id}/file", filename=f"tiktok-photos-{job_id[:8]}.zip", media_type="photo_slideshow", extraction_method=result.get("extraction_method"))
+                return
+            _job_update(job_id, status="extracting", stage="Resolving TikTok video", progress=1)
+            info = extract_tiktok_info(request_data["url"])
+            _job_update(job_id, title=info.get("title"), author=info.get("author"), thumbnail=info.get("thumbnail"), duration_seconds=info.get("duration_seconds"), extraction_method=(info.get("extraction_strategy") or {}).get("selected"), status="downloading", stage="Downloading watermark-free TikTok media" if request_data["mode"] == "video" else "Downloading TikTok audio", progress=2)
+            def tiktok_progress(data):
+                if data.get("status") == "downloading":
+                    total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+                    downloaded = data.get("downloaded_bytes") or 0
+                    percent = round(min(94, downloaded * 94 / total), 1) if total else 5
+                    _job_update(job_id, progress=max(2, percent), bytes_downloaded=downloaded)
+            result = download_tiktok(request_data["url"], final_path, request_data["mode"], tiktok_progress, request_data.get("format_id"))
+            _job_update(job_id, status="completed", stage="Ready", progress=100, bytes=result["bytes"], selected_format=result["format_id"], height=result.get("height"), width=result.get("width"), download_path=f"/jobs/{job_id}/file", filename=(result.get("title") or "kangodl-tiktok") + final_path.suffix, watermark_free=(request_data["mode"] == "video"), extraction_method=result.get("extraction_method"))
+            return
         _job_update(job_id, status="extracting", stage="Refreshing YouTube stream information", progress=1)
         info = extract_youtube_info(request_data["url"])
         formats = info["_internal_formats"]
@@ -307,25 +538,141 @@ async def run_media_tool(*args: str, timeout: int = 900):
             raise HTTPException(status_code=504, detail="Media processing timed out.")
         return process.returncode or 0, stdout, stderr
 
+@app.get("/strategies")
+def extraction_strategies():
+    """Expose the configured primary and fallback resolver for each platform."""
+    return {"ok": True, "strategies": STRATEGIES}
+
+
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "KangoDL Engine", "version": app.version, "extractors": ["kangodl-youtube"], "download_workers": 1}
+    return {"ok": True, "service": "KangoDL Engine", "version": app.version, "extractors": ["kangodl-youtube", "kangodl-tiktok-native", "kangodl-pornhub-native", "kangodl-pinterest-native", "kangodl-audiomack-native", "kangodl-instagram-native", "kangodl-snapchat-native", "kangodl-facebook-native", "kangodl-x-native", "kangodl-reddit-native"], "download_workers": 1}
+
+
+@app.get("/search/audiomack")
+def search_audiomack_route(query: str, limit: int = 20, page: int = 1, type: str = "songs"):
+    try:
+        return search_audiomack(query, limit=limit, page=page, kind=type)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)[:350]) from exc
+
+
+@app.get("/search/pinterest")
+def search_pinterest_route(query: str, limit: int = 20, page: int = 1, cursor: str | None = None):
+    try:
+        return search_pinterest(query, limit=limit, page=page, cursor=cursor)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)[:350]) from exc
+
+
+@app.get("/search")
+@app.get("/search/pornhub")
+def search(query: str, limit: int = 20, page: int = 1):
+    try:
+        return search_pornhub(query, limit=limit, page=page)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)[:350]) from exc
+
 
 @app.get("/info")
 def info(url: str):
     try:
+        if is_reddit_url(url):
+            return extract_reddit_info(url)
+        if is_x_url(url):
+            return extract_x_info(url)
+        if is_facebook_url(url):
+            return extract_facebook_info(url)
+        if is_snapchat_url(url):
+            return extract_snapchat_info(url)
+        if is_instagram_url(url):
+            return extract_instagram_info(url)
+        if is_pornhub_url(url):
+            return extract_pornhub_info(url)
+        if is_audiomack_url(url):
+            return extract_audiomack_info(url)
+        if is_pinterest_url(url):
+            return extract_pinterest_info(url)
+        if is_tiktok_url(url):
+            return extract_tiktok_info(url)
         data = extract_youtube_info(url)
         data.pop("_internal_formats", None)
         return data
-    except ExtractorError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (ExtractorError, Exception) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)[:350]) from exc
 
 @app.post("/jobs", status_code=202)
 def create_download_job(payload: DownloadRequest):
-    try:
-        video_id_from_url(payload.url)
-    except ExtractorError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if is_reddit_url(payload.url):
+        if payload.mode == "audio" and payload.output != "mp3":
+            raise HTTPException(status_code=422, detail="Reddit audio downloads require MP3 output.")
+        if payload.mode == "video" and payload.output not in {"mp4", "webm"}:
+            raise HTTPException(status_code=422, detail="Reddit video downloads require MP4 or WebM output.")
+        if payload.mode == "image" and payload.output != "jpg":
+            raise HTTPException(status_code=422, detail="Reddit single-image downloads require JPG output.")
+        if payload.mode == "photos" and payload.output != "zip":
+            raise HTTPException(status_code=422, detail="Reddit gallery downloads require ZIP output.")
+        if payload.mode not in {"audio", "video", "image", "photos"}:
+            raise HTTPException(status_code=422, detail="Unsupported Reddit download mode.")
+    if is_x_url(payload.url):
+        if payload.mode == "audio" and payload.output != "mp3":
+            raise HTTPException(status_code=422, detail="X audio downloads require MP3 output.")
+        if payload.mode == "video" and payload.output not in {"mp4", "webm"}:
+            raise HTTPException(status_code=422, detail="X video downloads require MP4 or WebM output.")
+        if payload.mode not in {"audio", "video"}:
+            raise HTTPException(status_code=422, detail="X currently supports public video and audio only.")
+    if is_facebook_url(payload.url):
+        if payload.mode == "audio" and payload.output != "mp3":
+            raise HTTPException(status_code=422, detail="Facebook audio downloads require MP3 output.")
+        if payload.mode == "video" and payload.output not in {"mp4", "webm"}:
+            raise HTTPException(status_code=422, detail="Facebook video downloads require MP4 or WebM output.")
+        if payload.mode not in {"audio", "video"}:
+            raise HTTPException(status_code=422, detail="Facebook currently supports public video and audio only.")
+    if is_audiomack_url(payload.url):
+        if payload.mode != "audio" or payload.output != "mp3":
+            raise HTTPException(status_code=422, detail="Audiomack currently supports audio mode with MP3 output only.")
+    if is_snapchat_url(payload.url):
+        if payload.mode == "audio" and payload.output != "mp3":
+            raise HTTPException(status_code=422, detail="Snapchat audio downloads require MP3 output.")
+        if payload.mode == "video" and payload.output not in {"mp4", "webm"}:
+            raise HTTPException(status_code=422, detail="Snapchat video downloads require MP4 or WebM output.")
+        if payload.mode not in {"audio", "video"}:
+            raise HTTPException(status_code=422, detail="Snapchat currently supports public Spotlight video and audio only.")
+    if is_instagram_url(payload.url):
+        if payload.mode == "audio" and payload.output != "mp3":
+            raise HTTPException(status_code=422, detail="Instagram audio downloads require MP3 output.")
+        if payload.mode == "image" and payload.output != "jpg":
+            raise HTTPException(status_code=422, detail="Instagram image downloads require JPG output.")
+        if payload.mode == "video" and payload.output not in {"mp4", "webm"}:
+            raise HTTPException(status_code=422, detail="Instagram video downloads require MP4 or WebM output.")
+        if payload.mode == "photos" and payload.output != "zip":
+            raise HTTPException(status_code=422, detail="Instagram carousel downloads require ZIP output.")
+        if payload.mode not in {"audio", "image", "video", "photos"}:
+            raise HTTPException(status_code=422, detail="Unsupported Instagram download mode.")
+    if not (is_tiktok_url(payload.url) or is_pornhub_url(payload.url) or is_pinterest_url(payload.url) or is_audiomack_url(payload.url) or is_instagram_url(payload.url) or is_snapchat_url(payload.url) or is_facebook_url(payload.url) or is_x_url(payload.url) or is_reddit_url(payload.url)):
+        if payload.mode == "photos" or payload.output == "zip":
+            if not is_pinterest_url(payload.url):
+                raise HTTPException(status_code=422, detail="Photo slideshow mode is only available for TikTok URLs.")
+        try:
+            video_id_from_url(payload.url)
+        except ExtractorError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if is_pornhub_url(payload.url) and (payload.mode == "photos" or payload.output == "zip"):
+        raise HTTPException(status_code=422, detail="Pornhub supports video and audio downloads, not photo slideshow mode.")
+    if is_pornhub_url(payload.url):
+        if payload.mode == "audio" and payload.output != "mp3":
+            raise HTTPException(status_code=422, detail="Pornhub audio downloads require MP3 output.")
+        if payload.mode == "video" and payload.output not in {"mp4", "webm"}:
+            raise HTTPException(status_code=422, detail="Pornhub video downloads require MP4 or WebM output.")
+    if is_pinterest_url(payload.url):
+        if payload.mode == "photos" or payload.output == "zip":
+            raise HTTPException(status_code=422, detail="Pinterest supports single-image and video pins, not TikTok-style photo slideshow ZIP mode.")
+        if payload.mode == "image" and payload.output != "jpg":
+            raise HTTPException(status_code=422, detail="Pinterest image downloads require JPG output.")
+        if payload.mode == "video" and payload.output not in {"mp4", "webm"}:
+            raise HTTPException(status_code=422, detail="Pinterest video downloads require MP4 or WebM output.")
+        if payload.mode == "audio" and payload.output != "mp3":
+            raise HTTPException(status_code=422, detail="Pinterest audio downloads require MP3 output.")
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
         if sum(1 for item in JOBS.values() if item.get("status") in {"queued", "extracting", "downloading", "processing"}) >= 6:

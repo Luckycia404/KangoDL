@@ -1,7 +1,8 @@
 from __future__ import annotations
-import json, re, secrets, string
+import json, os, re, secrets, string, http.cookiejar
 from urllib.parse import parse_qs, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen as _plain_urlopen, build_opener, HTTPCookieProcessor
+from app.extractors.strategy import strategy_info
 
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtube-nocookie.com"}
 WEB_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -13,6 +14,20 @@ VISIONOS_UA = f"com.google.visionos.youtube/{VISIONOS_VERSION}({VISIONOS_MODEL};
 
 class ExtractorError(Exception):
     pass
+
+# Optional authenticated YouTube session. Keep the cookie file outside the
+# repository and restrict it to the service account (chmod 600).
+_COOKIE_OPENER = None
+_COOKIE_FILE = os.environ.get("KANGODL_YOUTUBE_COOKIE_FILE")
+if _COOKIE_FILE:
+    _cookie_jar = http.cookiejar.MozillaCookieJar(_COOKIE_FILE)
+    _cookie_jar.load(ignore_discard=True, ignore_expires=False)
+    _COOKIE_OPENER = build_opener(HTTPCookieProcessor(_cookie_jar))
+
+def _open_url(request, timeout=25):
+    if _COOKIE_OPENER is not None:
+        return _COOKIE_OPENER.open(request, timeout=timeout)
+    return _plain_urlopen(request, timeout=timeout)
 
 def video_id_from_url(value: str) -> str:
     parsed = urlparse(value)
@@ -41,7 +56,7 @@ def _innertube_player(video_id: str, api_key: str, client_name: str, client_vers
         "User-Agent": user_agent, "Content-Type": "application/json",
         "Origin": "https://www.youtube.com", "Referer": "https://www.youtube.com/",
     })
-    with urlopen(request, timeout=25) as response:
+    with _open_url(request, timeout=25) as response:
         return json.loads(response.read(4_000_000).decode("utf-8"))
 
 def _innertube_visionos_player(video_id: str) -> tuple[dict, str]:
@@ -67,7 +82,7 @@ def _innertube_visionos_player(video_id: str) -> tuple[dict, str]:
 
     def post(endpoint: str, payload: dict) -> dict:
         request = Request(base + endpoint, data=json.dumps(payload).encode("utf-8"), headers=headers)
-        with urlopen(request, timeout=30) as response:
+        with _open_url(request, timeout=30) as response:
             return json.loads(response.read(4_000_000).decode("utf-8"))
 
     visitor_response = post("visitor_id?prettyPrint=false", {"context": context})
@@ -109,6 +124,8 @@ def extract_youtube_info(value: str) -> dict:
     api_key = None
     player = None
     player_user_agent = None
+    selected_client = None
+    attempts = []
     last_error = None
     # NewPipe's current extractor uses VISIONOS for stream extraction. It
     # avoids the older Android/iOS attestation path on eligible public videos.
@@ -117,10 +134,14 @@ def extract_youtube_info(value: str) -> dict:
         streams = candidate.get("streamingData", {})
         if candidate.get("playabilityStatus", {}).get("status") == "OK" and (streams.get("formats") or streams.get("adaptiveFormats")):
             player, player_user_agent = candidate, candidate_ua
+            selected_client = "VISIONOS"
+            attempts.append("VISIONOS")
         else:
             last_error = candidate.get("playabilityStatus", {}).get("reason") or candidate.get("playabilityStatus", {}).get("status")
+            attempts.append("VISIONOS-failed")
     except Exception as exc:
         last_error = f"VISIONOS {type(exc).__name__}"
+        attempts.append("VISIONOS-failed")
 
     clients = [
         ("ANDROID", "20.10.38", ANDROID_UA, {"androidSdkVersion": 35, "osName": "Android", "osVersion": "15", "platform": "MOBILE"}),
@@ -131,7 +152,7 @@ def extract_youtube_info(value: str) -> dict:
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
         request = Request(watch_url, headers={"User-Agent": WEB_UA, "Accept-Language": "en-US,en;q=0.9"})
         try:
-            with urlopen(request, timeout=25) as response:
+            with _open_url(request, timeout=25) as response:
                 page = response.read(5_000_000).decode("utf-8", "replace")
         except Exception as exc:
             raise ExtractorError(f"Could not load the public YouTube page ({type(exc).__name__}).") from exc
@@ -147,7 +168,10 @@ def extract_youtube_info(value: str) -> dict:
                 streams = candidate.get("streamingData", {})
                 if candidate.get("playabilityStatus", {}).get("status") == "OK" and (streams.get("formats") or streams.get("adaptiveFormats")):
                     player, player_user_agent = candidate, ua
+                    selected_client = name
+                    attempts.append(name)
                     break
+                attempts.append(name + "-failed")
                 last_error = candidate.get("playabilityStatus", {}).get("reason") or candidate.get("playabilityStatus", {}).get("status")
             except Exception as exc:
                 last_error = type(exc).__name__
@@ -174,6 +198,7 @@ def extract_youtube_info(value: str) -> dict:
         "direct_format_count": sum(1 for item in unique if item["has_direct_url"]),
         "signature_decipher_needed": any(item["requires_signature_decipher"] for item in unique),
         "expires_in_seconds": streaming.get("expiresInSeconds"),
-        "source": "YouTube public player API via KangoDL extractor", "player_client": "VISIONOS" if player_user_agent == VISIONOS_UA else "fallback",
+        "source": "KangoDL dual-client YouTube player resolver", "player_client": selected_client or "unknown",
+        "extraction_strategy": strategy_info("VISIONOS-Innertube", "ANDROID/IOS-Innertube", "VISIONOS-Innertube" if selected_client == "VISIONOS" else "ANDROID/IOS-Innertube", attempts),
         "_internal_formats": unique,
     }

@@ -7,3 +7,6 @@ storage/*
 node_modules/
 token-provider/.env
 token-provider/.secret
+*cookie*.txt
+
+*.bak-*
